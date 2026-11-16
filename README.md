@@ -12,7 +12,37 @@ A standalone, GitHub-compatible git forge in a single Node 22 process: git smart
 node main.ts
 ```
 
-The forge binds an ephemeral port and registers it with the suite at `$MAKEFUN_ENV_URL`; it is driven by the make.fun conformance suite as its only client.
+Node 22, standard library only — there is nothing to install. In the suite's
+trial mode (`MAKEFUN_ENV_URL` set) the forge binds an ephemeral port, POSTs it
+to `$MAKEFUN_ENV_URL/register`, serves until the env answers
+`GET $MAKEFUN_ENV_URL/done`, then exits 0. Every surface sits behind
+`Authorization: Bearer $MAKEFUN_SHOP_TOKEN` except `GET /healthz`.
+
+For local development, leave `MAKEFUN_ENV_URL` unset and pick a port:
+
+```sh
+FORGE_DEV_PORT=8791 MAKEFUN_SHOP_TOKEN=dev-token node --experimental-strip-types main.ts
+```
+
+then drive it with the bounty kit's suite
+(`node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:8791 --token dev-token [--perf]`),
+with curl, or with any git/GraphQL/MCP client.
+
+## Layout
+
+- `main.ts` — the env lifecycle (bind, register, poll done, exit 0)
+- `app.ts` — the HTTP front door: routing, the bearer-token gate, request ids
+- `store.ts` — forge state and rules: repos, issues, pulls, contents commits,
+  squash merges; a logical clock and counter ids keep runs deterministic
+- `gitobj.ts` — the git object model: sha1 objects, trees, commits, tags,
+  pack read/write with ofs/ref deltas, pkt-lines
+- `githttp.ts` — smart HTTP: protocol v2 advertisement and ls-refs, fetch
+  (shallow, deepen, incremental), receive-pack with report-status
+- `rest.ts` — the REST v3 surface
+- `graphql.ts` — a small GraphQL parser/executor with introspection,
+  `node(id:)`, cursor pagination and the issue/pull mutations
+- `mcp.ts` — MCP over Streamable HTTP: `server/discover` (2026-07-28),
+  the legacy `initialize` handshake, and six tools on the shared store
 
 ---
 
