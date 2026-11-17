@@ -37,9 +37,17 @@ export const EPOCH_BASE_SEC = 1_735_689_600;
 
 const COMMIT_TZ = '+0000';
 
+/** Memoized isoOf: the conversion is a pure function of the second. */
+const isoCache = new Map<number, string>();
+
 /** An ISO-8601 timestamp in GitHub's shape (no milliseconds). */
 export function isoOf(sec: number): string {
-  return new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const hit = isoCache.get(sec);
+  if (hit !== undefined) return hit;
+  const text = new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  if (isoCache.size >= 8192) isoCache.clear();
+  isoCache.set(sec, text);
+  return text;
 }
 
 export interface LabelRec {

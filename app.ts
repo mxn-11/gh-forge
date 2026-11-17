@@ -53,7 +53,7 @@ export function createApp(token: string): Server {
         }
         if (segments.length >= 2 && (segments[1] as string).endsWith('.git')) {
           const name = (segments[1] as string).slice(0, -'.git'.length);
-          await handleGit(forge, req, res, segments[0] as string, name, segments.slice(2));
+          await handleGit(forge, req, res, segments[0] as string, name, segments.slice(2), parsed);
           return;
         }
         sendJson(res, 404, { message: 'Not Found' });

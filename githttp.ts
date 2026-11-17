@@ -10,14 +10,12 @@ import {
   collectFetchObjects,
   getObject,
   isAncestor,
-  parsePack,
+  parsePackEntries,
   parsePktLines,
   peelToCommit,
   pktLine,
   PKT_FLUSH,
-  putObject,
   sidebandFrame,
-  type GitObject,
 } from './gitobj.ts';
 import type { Forge, Repo } from './store.ts';
 import { parseUrl, readBody, sendBuffer, type ParsedUrl } from './http-util.ts';
@@ -26,6 +24,11 @@ const ZERO = '0'.repeat(40);
 const UPLOAD_CAPS_V2 = ['version 2', 'fetch=shallow', 'ls-refs', 'object-format=sha1'];
 const UPLOAD_CAPS_V0 = 'side-band-64k thin-pack ofs-delta shallow symref=HEAD:%s';
 const RECEIVE_CAPS = 'report-status side-band-64k delete-refs ofs-delta';
+
+/** The v2 advertisement never changes: frame it once, replay it forever. */
+const V2_ADVERTISEMENT = Buffer.concat([...UPLOAD_CAPS_V2.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
+/** The git surface's 404 body, framed once. */
+const NOT_FOUND_BODY = Buffer.from(JSON.stringify({ message: 'Not Found' }), 'utf8');
 
 type Service = 'git-upload-pack' | 'git-receive-pack';
 
@@ -66,7 +69,7 @@ function advertise(res: ServerResponse, repo: Repo, service: Service, v2: boolea
   const contentType = `application/x-${service}-advertisement`;
   if (service === 'git-upload-pack' && v2) {
     // A v2 answer opens with the version line itself, no service preamble.
-    sendPkt(res, 200, contentType, [...UPLOAD_CAPS_V2.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
+    sendBuffer(res, 200, V2_ADVERTISEMENT, contentType);
     return;
   }
   const chunks: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
@@ -148,7 +151,7 @@ interface FetchArgs {
 const packCache = new Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>();
 const PACK_CACHE_LIMIT = 128;
 
-function fetchPack(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: string[]; unshallow: string[] } {
+function fetchPack(repo: Repo, args: FetchArgs): { key: string; pack: Buffer; shallow: string[]; unshallow: string[] } {
   const key = [
     repo.id,
     [...args.wants].sort().join(','),
@@ -157,7 +160,7 @@ function fetchPack(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: string
     args.depth === null ? 'full' : String(args.depth),
   ].join('|');
   const hit = packCache.get(key);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined) return { key, ...hit };
   const { objects, shallow, unshallow } = collectFetchObjects(repo.objects, args.wants, args.haves, args.depth, args.shallow);
   const built = { pack: buildPack([...objects.values()]), shallow, unshallow };
   if (packCache.size >= PACK_CACHE_LIMIT) {
@@ -165,11 +168,23 @@ function fetchPack(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: string
     if (oldest !== undefined) packCache.delete(oldest);
   }
   packCache.set(key, built);
-  return built;
+  return { key, ...built };
 }
 
-function fetchResponse(repo: Repo, args: FetchArgs, v2: boolean): Buffer[] {
-  const { pack, shallow, unshallow } = fetchPack(repo, args);
+/**
+ * Framed fetch replies, memoized on the same terms as the packs: the reply
+ * bytes are a pure function of the pack result plus, for v2, the
+ * acknowledgement shape (no haves -> NAK, otherwise an ACK of the first
+ * have). A clone workload's fifty identical fetches replay one buffer.
+ */
+const fetchResponseCache = new Map<string, Buffer>();
+
+function fetchResponse(repo: Repo, args: FetchArgs, v2: boolean): Buffer {
+  const { key, pack, shallow, unshallow } = fetchPack(repo, args);
+  const ackShape = v2 ? (args.haves.length === 0 ? 'nak' : `ack ${args.haves[0] as string}`) : 'v0';
+  const cacheKey = `${key}|${ackShape}`;
+  const hit = fetchResponseCache.get(cacheKey);
+  if (hit !== undefined) return hit;
   const chunks: Buffer[] = [];
   if (v2) {
     const acks: string[] = [];
@@ -188,15 +203,21 @@ function fetchResponse(repo: Repo, args: FetchArgs, v2: boolean): Buffer[] {
     chunks.push(pktLine('packfile\n'));
     chunks.push(...sidebandFrame(1, pack));
     chunks.push(PKT_FLUSH);
-    return chunks;
+  } else {
+    // v0: shallow lines, a NAK line, then the pack in side-band frames.
+    for (const sha of shallow) chunks.push(pktLine(`shallow ${sha}\n`));
+    for (const sha of unshallow) chunks.push(pktLine(`unshallow ${sha}\n`));
+    chunks.push(pktLine('NAK\n'));
+    chunks.push(...sidebandFrame(1, pack));
+    chunks.push(PKT_FLUSH);
   }
-  // v0: shallow lines, a NAK line, then the pack in side-band frames.
-  for (const sha of shallow) chunks.push(pktLine(`shallow ${sha}\n`));
-  for (const sha of unshallow) chunks.push(pktLine(`unshallow ${sha}\n`));
-  chunks.push(pktLine('NAK\n'));
-  chunks.push(...sidebandFrame(1, pack));
-  chunks.push(PKT_FLUSH);
-  return chunks;
+  const body = Buffer.concat(chunks);
+  if (fetchResponseCache.size >= PACK_CACHE_LIMIT) {
+    const oldest = fetchResponseCache.keys().next().value;
+    if (oldest !== undefined) fetchResponseCache.delete(oldest);
+  }
+  fetchResponseCache.set(cacheKey, body);
+  return body;
 }
 
 // ---------------------------------------------------------------- receive-pack
@@ -233,8 +254,10 @@ function receivePack(repo: Repo, body: Buffer): Buffer[] {
   let unpackError: string | null = parseError;
   if (unpackError === null && packBytes.length > 0) {
     try {
-      const objects: GitObject[] = parsePack(packBytes, (sha) => getObject(repo.objects, sha));
-      for (const object of objects) putObject(repo.objects, object.type, object.data);
+      const objects = parsePackEntries(packBytes, (sha) => getObject(repo.objects, sha));
+      for (const object of objects) {
+        if (!repo.objects.has(object.sha)) repo.objects.set(object.sha, { type: object.type, data: object.data });
+      }
     } catch (error) {
       unpackError = error instanceof Error ? error.message : 'unpack failed';
     }
@@ -296,14 +319,15 @@ export async function handleGit(
   owner: string,
   name: string,
   tail: readonly string[],
+  parsedIn?: ParsedUrl,
 ): Promise<void> {
-  const parsed: ParsedUrl = parseUrl(req);
+  const parsed: ParsedUrl = parsedIn ?? parseUrl(req);
   const repo = forge.findRepo(owner, name);
   const method = req.method ?? 'GET';
 
   if (tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs' && method === 'GET') {
     if (repo === undefined) {
-      sendBuffer(res, 404, Buffer.from(JSON.stringify({ message: 'Not Found' }), 'utf8'), 'application/json');
+      sendBuffer(res, 404, NOT_FOUND_BODY, 'application/json');
       return;
     }
     const service: Service = parsed.query.get('service') === 'git-receive-pack' ? 'git-receive-pack' : 'git-upload-pack';
@@ -314,7 +338,7 @@ export async function handleGit(
 
   if (tail.length === 1 && (tail[0] === 'git-upload-pack' || tail[0] === 'git-receive-pack') && method === 'POST') {
     if (repo === undefined) {
-      sendBuffer(res, 404, Buffer.from(JSON.stringify({ message: 'Not Found' }), 'utf8'), 'application/json');
+      sendBuffer(res, 404, NOT_FOUND_BODY, 'application/json');
       return;
     }
     const service = tail[0] as Service;
@@ -350,7 +374,7 @@ export async function handleGit(
           else if (arg.startsWith('deepen ')) fetchArgs.depth = Number(arg.slice(7).trim());
           else if (arg === 'done') fetchArgs.done = true;
         }
-        sendPkt(res, 200, resultType, fetchResponse(repo, fetchArgs, true));
+        sendBuffer(res, 200, fetchResponse(repo, fetchArgs, true), resultType);
         return;
       }
       sendBuffer(res, 400, Buffer.from('unsupported command\n', 'utf8'), 'text/plain');
@@ -375,9 +399,9 @@ export async function handleGit(
     };
     readSection(first, true);
     readSection(second, false);
-    sendPkt(res, 200, resultType, fetchResponse(repo, fetchArgs, false));
+    sendBuffer(res, 200, fetchResponse(repo, fetchArgs, false), resultType);
     return;
   }
 
-  sendBuffer(res, 404, Buffer.from(JSON.stringify({ message: 'Not Found' }), 'utf8'), 'application/json');
+  sendBuffer(res, 404, NOT_FOUND_BODY, 'application/json');
 }

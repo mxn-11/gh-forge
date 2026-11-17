@@ -63,12 +63,13 @@ export function sendJson(
   headers: Readonly<Record<string, string>> = {},
 ): void {
   const text = body === undefined ? '' : JSON.stringify(body);
+  const bytes = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': bytes.length,
     ...headers,
   });
-  res.end(text);
+  res.end(bytes);
 }
 
 /** Send a raw buffer reply (git protocol streams, advertisements). */
@@ -96,8 +97,24 @@ export interface ParsedUrl {
   readonly query: URLSearchParams;
 }
 
+/** Characters a request target may hold for the manual parse below. */
+const PLAIN_TARGET = /^[A-Za-z0-9\-._~!$&'()*+,;=:@/?]*$/;
+
 export function parseUrl(req: IncomingMessage): ParsedUrl {
-  const url = new URL(req.url ?? '/', 'http://forge.invalid');
+  const raw = req.url ?? '/';
+  // Fast path: an origin-form target with no %-escapes, no backslash, no
+  // fragment and no dot segments parses exactly as the URL parser would
+  // (decodeURIComponent is the identity without '%'; dot segments are the
+  // only ones the URL parser rewrites). Anything else takes the full parse.
+  if (raw.startsWith('/') && !raw.startsWith('//') && !raw.includes('\\') && !raw.includes('#') && PLAIN_TARGET.test(raw)) {
+    const q = raw.indexOf('?');
+    const path = q === -1 ? raw : raw.slice(0, q);
+    const segments = path.split('/').filter((part) => part !== '');
+    if (!segments.some((part) => part === '.' || part === '..')) {
+      return { path, segments, query: new URLSearchParams(q === -1 ? '' : raw.slice(q + 1)) };
+    }
+  }
+  const url = new URL(raw, 'http://forge.invalid');
   const segments = url.pathname
     .split('/')
     .filter((part) => part !== '')

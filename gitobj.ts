@@ -266,7 +266,21 @@ export function commitAncestors(store: ObjectStore, tip: string): Set<string> {
 /** True when `ancestor` is `descendant` itself or one of its ancestors. */
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(store, descendant).has(ancestor);
+  // Depth-first from the descendant, stopping the moment the ancestor is
+  // reached: the common push case (the old tip is the new tip's parent) is
+  // one step, where collecting the whole ancestry first was a full walk.
+  const seen = new Set<string>();
+  const stack = [descendant];
+  while (stack.length > 0) {
+    const sha = stack.pop() as string;
+    if (sha === ancestor) return true;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const commit = parseCommitCached(store, sha);
+    if (commit === null) continue;
+    for (const parent of commit.parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** Longest path (in edges) from the commit to a root, memoized per call set. */
@@ -511,11 +525,18 @@ interface PackEntry {
   baseOffset?: number;
 }
 
+/** A fully resolved pack object together with the id it hashes to. */
+export interface PackedObject extends GitObject {
+  readonly sha: string;
+}
+
 /**
- * Parse a pack stream into fully resolved objects. `lookup` finds delta bases
- * that live outside the pack (thin packs), by sha.
+ * Parse a pack stream into fully resolved objects, each with its id (the
+ * resolver hashes every object anyway to index delta bases, so callers that
+ * store the results need not hash them a second time). `lookup` finds delta
+ * bases that live outside the pack (thin packs), by sha.
  */
-export function parsePack(pack: Buffer, lookup: (sha: string) => GitObject | undefined): GitObject[] {
+export function parsePackEntries(pack: Buffer, lookup: (sha: string) => GitObject | undefined): PackedObject[] {
   if (pack.length < 12 + 20 || pack.toString('latin1', 0, 4) !== 'PACK') throw new Error('not a pack');
   const version = pack.readUInt32BE(4);
   if (version !== 2) throw new Error(`pack version ${version} is not supported`);
@@ -568,10 +589,13 @@ export function parsePack(pack: Buffer, lookup: (sha: string) => GitObject | und
   // Resolve in passes: plain objects first, then deltas whose bases are known
   // (a base may itself be a delta earlier in the pack, or live outside it).
   const resolved = new Array<GitObject | null>(entries.length).fill(null);
+  const ids = new Array<string>(entries.length).fill('');
   const bySha = new Map<string, GitObject>();
   const noteResolved = (index: number, object: GitObject): void => {
     resolved[index] = object;
-    bySha.set(objectId(object.type, object.data), object);
+    const sha = objectId(object.type, object.data);
+    ids[index] = sha;
+    bySha.set(sha, object);
   };
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i] as PackEntry & { offset: number };
@@ -599,7 +623,15 @@ export function parsePack(pack: Buffer, lookup: (sha: string) => GitObject | und
     }
     if (!progressed) throw new Error('pack has a delta whose base cannot be resolved');
   }
-  return resolved as GitObject[];
+  return (resolved as GitObject[]).map((object, index) => ({ ...object, sha: ids[index] as string }));
+}
+
+/**
+ * Parse a pack stream into fully resolved objects. `lookup` finds delta bases
+ * that live outside the pack (thin packs), by sha.
+ */
+export function parsePack(pack: Buffer, lookup: (sha: string) => GitObject | undefined): GitObject[] {
+  return parsePackEntries(pack, lookup);
 }
 
 /** Build a version-2 pack holding `objects` (no deltas), with its sha1 trailer. */
@@ -634,12 +666,19 @@ export function buildPack(objects: readonly GitObject[]): Buffer {
 
 // ---------------------------------------------------------------- pkt-lines
 
+const HEX_DIGITS = '0123456789abcdef';
+
 /** Frame one pkt-line (payload up to 65516 bytes). */
 export function pktLine(payload: Buffer | string): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = data.length + 4;
-  const head = Buffer.from(length.toString(16).padStart(4, '0'), 'latin1');
-  return Buffer.concat([head, data]);
+  const out = Buffer.allocUnsafe(length);
+  out[0] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+  out[1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+  out[2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+  out[3] = HEX_DIGITS.charCodeAt(length & 0xf);
+  data.copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'latin1');

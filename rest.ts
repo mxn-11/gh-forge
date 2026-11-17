@@ -32,17 +32,20 @@ const FAKE_ORIGIN = 'https://forge.invalid';
 
 // ---------------------------------------------------------------- shapes
 
+/** The viewer's JSON shape: one shared object (callers only embed it). */
+const USER_JSON: Record<string, unknown> = {
+  login: VIEWER.login,
+  id: VIEWER.id,
+  type: 'User',
+  name: VIEWER.name,
+  email: VIEWER.email,
+  site_admin: false,
+  url: `${FAKE_ORIGIN}/api/v3/users/${VIEWER.login}`,
+  html_url: `${FAKE_ORIGIN}/${VIEWER.login}`,
+};
+
 export function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    type: 'User',
-    name: VIEWER.name,
-    email: VIEWER.email,
-    site_admin: false,
-    url: `${FAKE_ORIGIN}/api/v3/users/${VIEWER.login}`,
-    html_url: `${FAKE_ORIGIN}/${VIEWER.login}`,
-  };
+  return USER_JSON;
 }
 
 export function repoJson(repo: Repo): Record<string, unknown> {
@@ -175,13 +178,13 @@ function commitJson(repo: Repo, sha: string): Record<string, unknown> {
  * when the issue itself does — the stamp covers every mutation path (PATCH
  * bumps updatedSec and state; a comment changes the count).
  */
-const issueBodyCache = new WeakMap<IssueRec, { stamp: string; body: string }>();
+const issueBodyCache = new WeakMap<IssueRec, { stamp: string; body: Buffer }>();
 
-function issueBodyText(repo: Repo, issue: IssueRec): string {
+function issueBodyBuffer(repo: Repo, issue: IssueRec): Buffer {
   const stamp = `${issue.updatedSec}|${issue.state}|${issue.comments.length}|${issue.title.length}`;
   const cached = issueBodyCache.get(issue);
   if (cached !== undefined && cached.stamp === stamp) return cached.body;
-  const body = JSON.stringify(issueJson(repo, issue));
+  const body = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
   issueBodyCache.set(issue, { stamp, body });
   return body;
 }
@@ -561,7 +564,7 @@ export async function handleRest(
     if (tail.length === 2) {
       if (method === 'GET') {
         const issue = forge.getIssue(repo, number);
-        sendBuffer(res, 200, Buffer.from(issueBodyText(repo, issue), 'utf8'), 'application/json');
+        sendBuffer(res, 200, issueBodyBuffer(repo, issue), 'application/json');
         return;
       }
       if (method === 'PATCH') {
